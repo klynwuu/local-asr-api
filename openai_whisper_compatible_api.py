@@ -1,4 +1,5 @@
-# @Author: Bi Ying
+# @Enhanced by @klynwuu 2026-02-20
+# @OriginalAuthor: Bi Ying
 # @Date:   2024-07-10 17:22:55
 import asyncio
 import shutil
