@@ -3,6 +3,7 @@
 # @Date:   2024-07-10 17:22:55
 import asyncio
 import shutil
+import subprocess
 import os
 import time
 from pathlib import Path
@@ -322,6 +323,32 @@ async def models():
     }
 
 
+def _preprocess_audio(input_path: Path, output_path: Path) -> Path:
+    """Downsample audio to 16kHz mono WAV using ffmpeg.
+
+    ASR models only need 16kHz mono. Converting upfront reduces memory usage
+    and speeds up inference — especially for high-quality inputs (44.1/48kHz stereo).
+    The API contract is unchanged; callers can still send any format ffmpeg supports.
+    """
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(input_path),
+                "-ar", "16000",      # 16kHz sample rate
+                "-ac", "1",          # mono
+                "-sample_fmt", "s16", # 16-bit (sufficient for speech)
+                str(output_path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return output_path
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # ffmpeg not available or conversion failed — fall back to original file
+        return input_path
+
+
 def _get_audio_duration_no_torch(path: Path) -> float:
     """Get duration in seconds without torch. Uses stdlib wave for .wav; else default."""
     try:
@@ -352,62 +379,85 @@ async def transcriptions(
     fileobj = file.file
     tmp_file = Path(TMP_DIR) / filename
 
+    preprocessed_file = None
     try:
         with open(tmp_file, "wb+") as upload_file:
             shutil.copyfileobj(fileobj, upload_file)
 
+        # Downsample to 16kHz mono WAV before inference (smaller, faster, less memory)
+        preprocessed_path = tmp_file.with_suffix(".16k.wav")
+        actual_file = _preprocess_audio(tmp_file, preprocessed_path)
+        if actual_file != tmp_file:
+            preprocessed_file = actual_file  # track for cleanup
+
         # Duration for progress bar: never use torch here so MLX-only envs work (no torch installed).
-        duration_seconds = _get_audio_duration_no_torch(tmp_file)
+        duration_seconds = _get_audio_duration_no_torch(actual_file)
         estimated_seconds = max(1.0, duration_seconds)
 
         backend = model  # capture for closure
 
         def run_inference():
             if backend == "mlx":
-                return model_inference(audio_path=str(tmp_file), language=language)
+                return model_inference(audio_path=str(actual_file), language=language)
             # SenseVoice: load and convert inside this thread so torch is only imported here.
             import torch
             import torchaudio
-            waveform, sample_rate = torchaudio.load(tmp_file)
+            waveform, sample_rate = torchaudio.load(actual_file)
             waveform_int = (waveform * np.iinfo(np.int32).max).to(dtype=torch.int32).squeeze()
             if len(waveform_int.shape) > 1:
                 waveform_int = waveform_int.float().mean(axis=0)
             input_wav = (sample_rate, waveform_int.numpy())
             return model_inference(input_wav=input_wav, language=language, show_emo=False)
 
-        # Progress bar: advance over estimated time so user sees activity; complete when inference finishes
-        pbar = tqdm(total=100, desc="Transcribing", unit="%", ncols=80, leave=True)
-        try:
-            async def update_progress(fut: asyncio.Future):
-                start = time.perf_counter()
-                while not fut.done():
-                    await asyncio.sleep(0.1)
-                    elapsed = time.perf_counter() - start
-                    n = min(99, int(elapsed / estimated_seconds * 100))
-                    pbar.n = n
-                    pbar.refresh()
-
-            loop = asyncio.get_running_loop()
-            inference_fut = loop.run_in_executor(None, run_inference)
-            progress_task = asyncio.create_task(update_progress(inference_fut))
+        # MLX/Metal is NOT thread-safe — running inference in a background thread
+        # causes "A command encoder is already encoding to this command buffer" crashes.
+        # Run MLX inference directly on the main thread; use executor only for SenseVoice.
+        if backend == "mlx":
+            pbar = tqdm(total=100, desc="Transcribing", unit="%", ncols=80, leave=True)
             try:
-                result = await inference_fut
+                pbar.n = 10
+                pbar.refresh()
+                result = run_inference()
+                pbar.n = 100
+                pbar.refresh()
+                return {"text": result}
             finally:
-                progress_task.cancel()
+                pbar.close()
+        else:
+            pbar = tqdm(total=100, desc="Transcribing", unit="%", ncols=80, leave=True)
+            try:
+                async def update_progress(fut: asyncio.Future):
+                    start = time.perf_counter()
+                    while not fut.done():
+                        await asyncio.sleep(0.1)
+                        elapsed = time.perf_counter() - start
+                        n = min(99, int(elapsed / estimated_seconds * 100))
+                        pbar.n = n
+                        pbar.refresh()
+
+                loop = asyncio.get_running_loop()
+                inference_fut = loop.run_in_executor(None, run_inference)
+                progress_task = asyncio.create_task(update_progress(inference_fut))
                 try:
-                    await progress_task
-                except asyncio.CancelledError:
-                    pass
-            pbar.n = 100
-            return {"text": result}
-        finally:
-            pbar.close()
+                    result = await inference_fut
+                finally:
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
+                pbar.n = 100
+                return {"text": result}
+            finally:
+                pbar.close()
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail=f"Error processing audio file: {str(e)}")
     finally:
         if tmp_file.exists():
             tmp_file.unlink()
+        if preprocessed_file and preprocessed_file.exists():
+            preprocessed_file.unlink()
 
 
 if __name__ == "__main__":
